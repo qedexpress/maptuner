@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OSM 地图标注工具 (JSON生成器)</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" crossorigin=""/>
+
     <style>
         body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; height: 100vh; overflow: hidden; }
         
@@ -75,6 +76,12 @@
             <button id="drag-lock-btn" class="btn btn-primary" onclick="toggleDragLock()">🔓 允许拖动</button>
         </div>
 
+        <div class="control-group">
+            <label><strong>自动打点:</strong></label>
+            <button class="btn btn-success" onclick="startAutoMarking()">📍 框选区域自动打点</button>
+            <div id="auto-mark-status" style="font-size: 12px; color: #666; margin-top:5px;"></div>
+        </div>
+
         <div id="properties-panel" class="control-group" style="display:none;">
             <h3 id="prop-title">属性编辑</h3>
             <div id="prop-form"></div>
@@ -92,6 +99,7 @@
     <div id="map"></div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js" crossorigin=""></script>
 
     <script>
         // --- 数据存储 ---
@@ -106,6 +114,8 @@
         let selectedNodeUuid = null; // 用于连线时的第一个点
         let editingEntity = null; // 当前正在编辑的对象 {type: 'node'|'edge', uuid: ''}
         let dragLocked = false; // 拖动锁定状态
+        let rectangleSelector = null; // 用于框选的矩形
+        let isAutoMarkingMode = false; // 是否处于自动打点模式
 
         // Leaflet 图层存储，用于交互
         const markersMap = {}; // uuid -> leaflet marker
@@ -527,6 +537,347 @@
             d.innerText = msg;
             document.body.appendChild(d);
             setTimeout(() => d.remove(), 2000);
+        }
+
+        // --- 自动打点功能 ---
+
+        function startAutoMarking() {
+            if (isAutoMarkingMode) {
+                cancelAutoMarking();
+                return;
+            }
+
+            isAutoMarkingMode = true;
+            updateAutoMarkStatus("请在地图上拖拽框选区域");
+
+            // 禁用地图点击添加点的功能
+            const originalMode = currentMode;
+            setMode('view');
+
+            // 创建矩形选择工具
+            rectangleSelector = new L.Draw.Rectangle(map, {
+                shapeOptions: {
+                    color: '#ff7800',
+                    weight: 2,
+                    opacity: 0.8,
+                    fillOpacity: 0.2
+                }
+            });
+
+            // 监听矩形绘制完成事件
+            map.on(L.Draw.Event.CREATED, handleRectangleCreated);
+
+            rectangleSelector.enable();
+        }
+
+        function cancelAutoMarking() {
+            isAutoMarkingMode = false;
+            updateAutoMarkStatus("");
+
+            if (rectangleSelector) {
+                rectangleSelector.disable();
+                rectangleSelector = null;
+            }
+
+            map.off(L.Draw.Event.CREATED, handleRectangleCreated);
+        }
+
+        async function handleRectangleCreated(e) {
+            const layer = e.layer;
+            const bounds = layer.getBounds();
+
+            // 停止绘制模式
+            cancelAutoMarking();
+
+            // 计算选区面积（平方公里）
+            const area = calculateArea(bounds);
+
+            if (area > 10) {
+                alert(`选择区域面积约 ${area.toFixed(2)} km²，超过 10 km² 限制！\n\n为确保性能和准确性，请分多次打点。`);
+                return;
+            }
+
+            updateAutoMarkStatus(`正在查询路口数据（区域：${area.toFixed(2)} km²）...`);
+
+            try {
+                // 从 OpenStreetMap 获取路口数据
+                const intersections = await fetchIntersections(bounds);
+
+                if (intersections.length === 0) {
+                    updateAutoMarkStatus("该区域未找到路口");
+                    showToast("未找到路口数据");
+                    return;
+                }
+
+                updateAutoMarkStatus(`找到 ${intersections.length} 个路口，正在处理...`);
+
+                // 去重并添加节点
+                const addedNodes = await addIntersectionsWithDedup(intersections);
+
+                updateAutoMarkStatus(`成功添加 ${addedNodes.length} 个新路口`);
+
+                // 自动连线
+                if (addedNodes.length > 0) {
+                    updateAutoMarkStatus(`正在自动连线...`);
+                    const addedEdges = await autoConnectNodes(addedNodes, bounds);
+                    updateAutoMarkStatus(`完成！添加了 ${addedNodes.length} 个路口和 ${addedEdges.length} 条连线`);
+                    showToast(`自动打点完成：${addedNodes.length} 个路口，${addedEdges.length} 条连线`);
+                }
+
+            } catch (error) {
+                console.error("自动打点失败:", error);
+                updateAutoMarkStatus("自动打点失败：" + error.message);
+                alert("自动打点失败：" + error.message);
+            }
+        }
+
+        function calculateArea(bounds) {
+            // 计算矩形区域面积（平方公里）
+            const ne = bounds.getNorthEast();
+            const sw = bounds.getSouthWest();
+            const nw = L.latLng(ne.lat, sw.lng);
+            const se = L.latLng(sw.lat, ne.lng);
+
+            const width = map.distance(nw, ne); // 米
+            const height = map.distance(nw, sw); // 米
+
+            return (width * height) / 1000000; // 转换为平方公里
+        }
+
+        async function fetchIntersections(bounds) {
+            const south = bounds.getSouth();
+            const west = bounds.getWest();
+            const north = bounds.getNorth();
+            const east = bounds.getEast();
+
+            updateAutoMarkStatus(`正在获取道路数据...`);
+
+            // 使用 Overpass API 获取道路数据
+            const query = `
+                [out:json][timeout:30];
+                (
+                  way["highway"]["highway"!="footway"]["highway"!="path"]["highway"!="cycleway"]["highway"!="steps"](${south},${west},${north},${east});
+                );
+                out body;
+                >;
+                out skel qt;
+            `;
+
+            const url = 'https://overpass-api.de/api/interpreter';
+
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    body: query
+                });
+
+                if (!response.ok) {
+                    throw new Error(`API 响应错误: ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                updateAutoMarkStatus(`已获取 ${data.elements.filter(e => e.type === 'way').length} 条道路，正在计算路口...`);
+
+                // 计算路口
+                return calculateIntersectionsFromWays(data.elements, bounds);
+
+            } catch (error) {
+                console.error('Overpass API 错误:', error);
+                throw new Error('无法获取道路数据，请检查网络连接');
+            }
+        }
+
+        function calculateIntersectionsFromWays(elements, bounds) {
+            // 构建节点映射和道路映射
+            const nodeMap = new Map(); // nodeId -> {lat, lon, wayIds: []}
+            const ways = [];
+
+            // 第一遍：收集所有节点
+            elements.forEach(element => {
+                if (element.type === 'node') {
+                    nodeMap.set(element.id, {
+                        id: element.id,
+                        lat: element.lat,
+                        lon: element.lon,
+                        wayIds: [],
+                        tags: element.tags || {}
+                    });
+                }
+            });
+
+            // 第二遍：收集道路并关联节点
+            elements.forEach(element => {
+                if (element.type === 'way' && element.nodes && element.nodes.length >= 2) {
+                    ways.push({
+                        id: element.id,
+                        nodes: element.nodes,
+                        tags: element.tags || {}
+                    });
+
+                    // 记录每个节点属于哪些道路
+                    element.nodes.forEach(nodeId => {
+                        const node = nodeMap.get(nodeId);
+                        if (node) {
+                            node.wayIds.push(element.id);
+                        }
+                    });
+                }
+            });
+
+            // 找出路口：被2条或更多道路共享的节点
+            const intersections = [];
+            const south = bounds.getSouth();
+            const west = bounds.getWest();
+            const north = bounds.getNorth();
+            const east = bounds.getEast();
+
+            nodeMap.forEach((node, nodeId) => {
+                // 路口条件：
+                // 1. 至少被2条不同道路使用
+                // 2. 在边界范围内
+                if (node.wayIds.length >= 2 &&
+                    node.lat >= south && node.lat <= north &&
+                    node.lon >= west && node.lon <= east) {
+
+                    // 检查是否是道路的端点（起点或终点）
+                    let isEndpoint = false;
+                    for (let wayId of node.wayIds) {
+                        const way = ways.find(w => w.id === wayId);
+                        if (way && (way.nodes[0] === nodeId || way.nodes[way.nodes.length - 1] === nodeId)) {
+                            isEndpoint = true;
+                            break;
+                        }
+                    }
+
+                    // 添加路口
+                    intersections.push({
+                        osmId: nodeId,
+                        lat: node.lat,
+                        lon: node.lon,
+                        tags: node.tags,
+                        wayCount: node.wayIds.length,
+                        isEndpoint: isEndpoint
+                    });
+                }
+            });
+
+            // 按道路数量排序（更多道路交汇的路口优先）
+            intersections.sort((a, b) => b.wayCount - a.wayCount);
+
+            return intersections;
+        }
+
+        function addIntersectionsWithDedup(intersections) {
+            return new Promise((resolve) => {
+                const addedNodes = [];
+                const DEDUP_THRESHOLD = 10; // 10米内视为重复
+
+                intersections.forEach(intersection => {
+                    const pos = [intersection.lat, intersection.lon];
+
+                    // 检查是否与已有点重复
+                    const isDuplicate = data.nodes.some(existingNode => {
+                        const distance = map.distance(existingNode.pos, pos);
+                        return distance < DEDUP_THRESHOLD;
+                    });
+
+                    if (!isDuplicate) {
+                        // 生成节点名称
+                        let name = "路口";
+
+                        if (intersection.tags.name) {
+                            name = intersection.tags.name;
+                        } else if (intersection.tags.highway === "traffic_signals") {
+                            name = "红绿灯";
+                        } else if (intersection.tags.highway === "crossing") {
+                            name = "人行横道";
+                        } else if (intersection.wayCount >= 4) {
+                            name = `路口 (${intersection.wayCount}条路)`;
+                        } else if (intersection.wayCount === 3) {
+                            name = "三岔路口";
+                        } else if (intersection.wayCount === 2) {
+                            name = intersection.isEndpoint ? "路段连接" : "路口";
+                        }
+
+                        const uuid = generateUUID();
+                        const newNode = {
+                            uuid: uuid,
+                            name: name,
+                            pos: pos
+                        };
+
+                        data.nodes.push(newNode);
+                        renderNode(newNode);
+                        addedNodes.push(newNode);
+                    }
+                });
+
+                resolve(addedNodes);
+            });
+        }
+
+        function autoConnectNodes(nodes, bounds) {
+            return new Promise((resolve) => {
+                const addedEdges = [];
+                const MAX_CONNECTION_DISTANCE = 200; // 最大连接距离200米
+
+                // 对于每个新添加的节点
+                nodes.forEach(node => {
+                    // 找到该区域内所有节点（包括原有节点和新节点）
+                    const nearbyNodes = data.nodes.filter(n => {
+                        if (n.uuid === node.uuid) return false;
+
+                        const distance = map.distance(node.pos, n.pos);
+                        return distance <= MAX_CONNECTION_DISTANCE;
+                    });
+
+                    // 按距离排序
+                    nearbyNodes.sort((a, b) => {
+                        const distA = map.distance(node.pos, a.pos);
+                        const distB = map.distance(node.pos, b.pos);
+                        return distA - distB;
+                    });
+
+                    // 连接到最近的2-4个节点（模拟道路网）
+                    const connectCount = Math.min(4, nearbyNodes.length);
+                    for (let i = 0; i < connectCount; i++) {
+                        const targetNode = nearbyNodes[i];
+
+                        // 检查是否已存在连线
+                        const exists = data.edges.some(e =>
+                            (e.start === node.uuid && e.end === targetNode.uuid) ||
+                            (e.start === targetNode.uuid && e.end === node.uuid)
+                        );
+
+                        if (!exists) {
+                            // 使用现有的距离计算方法
+                            const dist = map.distance(node.pos, targetNode.pos);
+                            const uuid = generateUUID();
+                            const newEdge = {
+                                uuid: uuid,
+                                start: node.uuid,
+                                end: targetNode.uuid,
+                                distance: parseFloat(dist.toFixed(2)),
+                                walk_punish: 0,
+                                bike_punish: 0,
+                                car_punish: 0
+                            };
+
+                            data.edges.push(newEdge);
+                            renderEdge(newEdge);
+                            addedEdges.push(newEdge);
+                        }
+                    }
+                });
+
+                resolve(addedEdges);
+            });
+        }
+
+        function updateAutoMarkStatus(message) {
+            const statusDiv = document.getElementById('auto-mark-status');
+            statusDiv.innerText = message;
         }
 
         // 启动
