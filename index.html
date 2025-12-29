@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OSM 地图标注工具 (JSON生成器)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; height: 100vh; overflow: hidden; }
+        
+        /* 侧边栏样式 */
+        #sidebar {
+            width: 350px;
+            background-color: #f8f9fa;
+            border-right: 1px solid #ddd;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            box-shadow: 2px 0 5px rgba(0,0,0,0.1);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+
+        /* 地图容器样式 */
+        #map { flex-grow: 1; height: 100%; cursor: crosshair; }
+
+        h2 { margin-top: 0; color: #333; }
+        h3 { border-bottom: 2px solid #007bff; padding-bottom: 5px; margin-bottom: 15px; color: #555; }
+
+        /* 控件样式 */
+        .control-group { margin-bottom: 20px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .btn {
+            display: block; width: 100%; padding: 10px; margin-bottom: 10px; border: none; border-radius: 4px; 
+            cursor: pointer; font-size: 14px; transition: background 0.2s; color: white; text-align: center;
+        }
+        .btn-primary { background-color: #007bff; }
+        .btn-success { background-color: #28a745; }
+        .btn-danger { background-color: #dc3545; }
+        .btn:hover { opacity: 0.9; }
+        
+        .mode-selector { display: flex; gap: 5px; margin-bottom: 10px; }
+        .mode-btn { flex: 1; padding: 8px; background: #e9ecef; border: 1px solid #ced4da; cursor: pointer; color: #495057; }
+        .mode-btn.active { background: #007bff; color: white; border-color: #007bff; }
+
+        /* 表单样式 */
+        .form-group { margin-bottom: 10px; }
+        .form-group label { display: block; font-size: 12px; color: #666; margin-bottom: 4px; }
+        .form-group input { width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
+        .readonly-input { background-color: #e9ecef; color: #6c757d; }
+
+        #output-area { margin-top: auto; }
+        
+        /* 选中状态的点样式 */
+        .selected-marker-icon { filter: hue-rotate(150deg); } 
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <h2>🗺️ 地图标注工具</h2>
+        
+        <div class="control-group">
+            <label><strong>当前模式:</strong></label>
+            <div class="mode-selector">
+                <button class="mode-btn active" onclick="setMode('view')">浏览/编辑</button>
+                <button class="mode-btn" onclick="setMode('point')">添加点</button>
+                <button class="mode-btn" onclick="setMode('line')">连线</button>
+            </div>
+            <div id="instruction" style="font-size: 12px; color: #666; margin-top:5px;">点击地图上的点或线进行编辑。</div>
+        </div>
+
+        <div class="control-group">
+            <label><strong>拖动控制:</strong></label>
+            <button id="drag-lock-btn" class="btn btn-primary" onclick="toggleDragLock()">🔓 允许拖动</button>
+        </div>
+
+        <div id="properties-panel" class="control-group" style="display:none;">
+            <h3 id="prop-title">属性编辑</h3>
+            <div id="prop-form"></div>
+            <button class="btn btn-primary" onclick="saveProperties()">保存修改</button>
+            <button class="btn btn-danger" onclick="deleteCurrentEntity()">删除此项</button>
+        </div>
+
+        <div id="output-area">
+            <button class="btn btn-primary" onclick="importJSON()">导入 JSON 数据</button>
+            <button class="btn btn-success" onclick="exportJSON()">下载 JSON 数据</button>
+            <input type="file" id="json-file-input" accept=".json" style="display:none;" onchange="handleFileSelect(event)">
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+    <script>
+        // --- 数据存储 ---
+        const data = {
+            nodes: [], // { uuid, name, pos: [lat, lng] }
+            edges: []  // { uuid, start, end, distance, walk_punish, bike_punish, car_punish }
+        };
+
+        // --- 全局状态 ---
+        let map;
+        let currentMode = 'view'; // view, point, line
+        let selectedNodeUuid = null; // 用于连线时的第一个点
+        let editingEntity = null; // 当前正在编辑的对象 {type: 'node'|'edge', uuid: ''}
+        let dragLocked = false; // 拖动锁定状态
+
+        // Leaflet 图层存储，用于交互
+        const markersMap = {}; // uuid -> leaflet marker
+        const polylinesMap = {}; // uuid -> leaflet polyline
+
+        // --- 初始化地图 ---
+        function initMap() {
+            // 默认定位到指定坐标
+            map = L.map('map').setView([36.070165121277796, 120.41910235636723], 13);
+
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            }).addTo(map);
+
+            // 地图点击事件（用于添加点）
+            map.on('click', function(e) {
+                if (currentMode === 'point') {
+                    addNode(e.latlng);
+                } else {
+                    deselectAll();
+                }
+            });
+        }
+
+        // --- 核心逻辑：添加节点 ---
+        function addNode(latlng) {
+            const uuid = generateUUID();
+            const newNode = {
+                uuid: uuid,
+                name: "New Point",
+                pos: [latlng.lat, latlng.lng]
+            };
+            
+            data.nodes.push(newNode);
+            renderNode(newNode);
+            console.log("Added Node:", newNode);
+        }
+
+        // --- 渲染节点 ---
+        function renderNode(nodeData) {
+            const marker = L.marker(nodeData.pos, {draggable: !dragLocked}).addTo(map);
+            marker.nodeUuid = nodeData.uuid; // 绑定 ID 到对象
+
+            // 点击 Marker 事件
+            marker.on('click', (e) => {
+                L.DomEvent.stopPropagation(e); // 防止触发地图点击
+                handleNodeClick(nodeData.uuid);
+            });
+
+            // 拖拽 Marker 更新坐标
+            marker.on('dragend', (e) => {
+                const newPos = e.target.getLatLng();
+                const node = data.nodes.find(n => n.uuid === nodeData.uuid);
+                if(node) {
+                    node.pos = [newPos.lat, newPos.lng];
+                    updateConnectedEdges(nodeData.uuid); // 更新连接的线
+                    if (editingEntity && editingEntity.uuid === nodeData.uuid) {
+                        loadProperties('node', nodeData.uuid); // 刷新面板坐标显示
+                    }
+                }
+            });
+
+            markersMap[nodeData.uuid] = marker;
+        }
+
+        // --- 核心逻辑：节点点击处理 (连线或编辑) ---
+        function handleNodeClick(uuid) {
+            if (currentMode === 'line') {
+                // 连线逻辑
+                if (selectedNodeUuid === null) {
+                    // 选中第一个点
+                    selectedNodeUuid = uuid;
+                    highlightMarker(uuid, true);
+                    showToast("请点击第二个点以连接");
+                } else if (selectedNodeUuid === uuid) {
+                    // 取消选中
+                    highlightMarker(uuid, false);
+                    selectedNodeUuid = null;
+                } else {
+                    // 选中第二个点 -> 创建连线
+                    addEdge(selectedNodeUuid, uuid);
+                    highlightMarker(selectedNodeUuid, false);
+                    selectedNodeUuid = null;
+                }
+            } else {
+                // 编辑模式
+                deselectAll();
+                loadProperties('node', uuid);
+            }
+        }
+
+        // --- 核心逻辑：添加连线 ---
+        function addEdge(startUuid, endUuid) {
+            // 检查是否重复
+            const exists = data.edges.some(e => 
+                (e.start === startUuid && e.end === endUuid) || 
+                (e.start === endUuid && e.end === startUuid)
+            );
+            if (exists) {
+                alert("这两点之间已经存在连线！");
+                return;
+            }
+
+            const startNode = data.nodes.find(n => n.uuid === startUuid);
+            const endNode = data.nodes.find(n => n.uuid === endUuid);
+
+            // 计算距离 (米)
+            const dist = map.distance(startNode.pos, endNode.pos);
+
+            const uuid = generateUUID();
+            const newEdge = {
+                uuid: uuid,
+                start: startUuid,
+                end: endUuid,
+                distance: parseFloat(dist.toFixed(2)),
+                walk_punish: 0,
+                bike_punish: 0,
+                car_punish: 0
+            };
+
+            data.edges.push(newEdge);
+            renderEdge(newEdge);
+            console.log("Added Edge:", newEdge);
+        }
+
+        // --- 渲染连线 ---
+        function renderEdge(edgeData) {
+            const startNode = data.nodes.find(n => n.uuid === edgeData.start);
+            const endNode = data.nodes.find(n => n.uuid === edgeData.end);
+
+            if(!startNode || !endNode) return;
+
+            const latlngs = [startNode.pos, endNode.pos];
+            const polyline = L.polyline(latlngs, {color: 'blue', weight: 5, opacity: 0.6}).addTo(map);
+            polyline.edgeUuid = edgeData.uuid;
+
+            // 线段点击事件
+            polyline.on('click', (e) => {
+                L.DomEvent.stopPropagation(e);
+                if (currentMode === 'view') {
+                    deselectAll();
+                    // 高亮线段
+                    polyline.setStyle({color: 'red'});
+                    loadProperties('edge', edgeData.uuid);
+                }
+            });
+
+            polylinesMap[edgeData.uuid] = polyline;
+        }
+
+        // --- 拖拽点时更新连线视觉 ---
+        function updateConnectedEdges(nodeUuid) {
+            data.edges.forEach(edge => {
+                if (edge.start === nodeUuid || edge.end === nodeUuid) {
+                    const polyline = polylinesMap[edge.uuid];
+                    const n1 = data.nodes.find(n => n.uuid === edge.start);
+                    const n2 = data.nodes.find(n => n.uuid === edge.end);
+                    if (polyline && n1 && n2) {
+                        polyline.setLatLngs([n1.pos, n2.pos]);
+                        // 自动更新距离
+                        edge.distance = parseFloat(map.distance(n1.pos, n2.pos).toFixed(2));
+                        // 如果当前正在编辑这条线，刷新距离显示
+                        if (editingEntity && editingEntity.uuid === edge.uuid) {
+                            document.getElementById('inp-distance').value = edge.distance;
+                        }
+                    }
+                }
+            });
+        }
+
+        // --- 属性面板逻辑 ---
+        function loadProperties(type, uuid) {
+            const panel = document.getElementById('properties-panel');
+            const form = document.getElementById('prop-form');
+            const title = document.getElementById('prop-title');
+            
+            panel.style.display = 'block';
+            form.innerHTML = '';
+            editingEntity = { type, uuid };
+
+            if (type === 'node') {
+                const node = data.nodes.find(n => n.uuid === uuid);
+                title.innerText = "编辑点属性";
+                form.innerHTML += createInput('UUID', 'inp-uuid', node.uuid, true);
+                form.innerHTML += createInput('名称 (Name)', 'inp-name', node.name);
+                form.innerHTML += createInput('坐标 (Pos)', 'inp-pos', node.pos.join(', '), true);
+            } else {
+                const edge = data.edges.find(e => e.uuid === uuid);
+                title.innerText = "编辑线属性";
+                form.innerHTML += createInput('UUID', 'inp-uuid', edge.uuid, true);
+                form.innerHTML += createInput('距离 (Distance)', 'inp-distance', edge.distance);
+                form.innerHTML += createInput('Walk Punish', 'inp-walk', edge.walk_punish, false, 'number');
+                form.innerHTML += createInput('Bike Punish', 'inp-bike', edge.bike_punish, false, 'number');
+                form.innerHTML += createInput('Car Punish', 'inp-car', edge.car_punish, false, 'number');
+            }
+        }
+
+        function createInput(label, id, value, readonly = false, type = 'text') {
+            return `
+                <div class="form-group">
+                    <label>${label}</label>
+                    <input type="${type}" id="${id}" value="${value}" ${readonly ? 'readonly class="readonly-input"' : ''}>
+                </div>
+            `;
+        }
+
+        function saveProperties() {
+            if (!editingEntity) return;
+
+            if (editingEntity.type === 'node') {
+                const node = data.nodes.find(n => n.uuid === editingEntity.uuid);
+                node.name = document.getElementById('inp-name').value;
+                // 更新 Marker Popup 或 Tooltip (可选)
+                markersMap[node.uuid].bindPopup(node.name).openPopup();
+            } else {
+                const edge = data.edges.find(e => e.uuid === editingEntity.uuid);
+                edge.distance = parseFloat(document.getElementById('inp-distance').value);
+                edge.walk_punish = parseFloat(document.getElementById('inp-walk').value);
+                edge.bike_punish = parseFloat(document.getElementById('inp-bike').value);
+                edge.car_punish = parseFloat(document.getElementById('inp-car').value);
+            }
+            showToast("属性已保存");
+        }
+
+        function deleteCurrentEntity() {
+            if (!editingEntity) return;
+            if (!confirm("确定要删除吗？")) return;
+
+            if (editingEntity.type === 'node') {
+                // 删除点及相关连线
+                const uuid = editingEntity.uuid;
+                
+                // 1. 删除相关连线数据和视图
+                const relatedEdges = data.edges.filter(e => e.start === uuid || e.end === uuid);
+                relatedEdges.forEach(e => {
+                    map.removeLayer(polylinesMap[e.uuid]);
+                    delete polylinesMap[e.uuid];
+                });
+                data.edges = data.edges.filter(e => e.start !== uuid && e.end !== uuid);
+
+                // 2. 删除点视图
+                map.removeLayer(markersMap[uuid]);
+                delete markersMap[uuid];
+
+                // 3. 删除点数据
+                data.nodes = data.nodes.filter(n => n.uuid !== uuid);
+
+            } else {
+                // 仅删除连线
+                const uuid = editingEntity.uuid;
+                map.removeLayer(polylinesMap[uuid]);
+                delete polylinesMap[uuid];
+                data.edges = data.edges.filter(e => e.uuid !== uuid);
+            }
+
+            deselectAll();
+            document.getElementById('properties-panel').style.display = 'none';
+        }
+
+        // --- 辅助功能 ---
+        function setMode(mode) {
+            currentMode = mode;
+            document.querySelectorAll('.mode-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active'); // 简单的事件目标处理，实际项目中最好用ID
+            
+            // 重置状态
+            selectedNodeUuid = null;
+            deselectAll();
+
+            const instruction = document.getElementById('instruction');
+            if(mode === 'view') instruction.innerText = "点击地图上的点或线进行编辑/拖拽。";
+            if(mode === 'point') instruction.innerText = "点击地图任意空白处添加新的点。";
+            if(mode === 'line') instruction.innerText = "依次点击两个点以建立连接。";
+        }
+
+        function deselectAll() {
+            document.getElementById('properties-panel').style.display = 'none';
+            editingEntity = null;
+            // 重置所有线的颜色
+            Object.values(polylinesMap).forEach(poly => poly.setStyle({color: 'blue'}));
+            // 重置所有点的颜色 (这里主要指取消高亮)
+            Object.keys(markersMap).forEach(k => highlightMarker(k, false));
+        }
+
+        function highlightMarker(uuid, active) {
+            const marker = markersMap[uuid];
+            if (!marker) return;
+            const icon = marker.getElement();
+            if (icon) {
+                if (active) icon.classList.add('selected-marker-icon');
+                else icon.classList.remove('selected-marker-icon');
+            }
+        }
+
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        function exportJSON() {
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data, null, 2));
+            const downloadAnchorNode = document.createElement('a');
+            downloadAnchorNode.setAttribute("href", dataStr);
+            downloadAnchorNode.setAttribute("download", "map_data.json");
+            document.body.appendChild(downloadAnchorNode);
+            downloadAnchorNode.click();
+            downloadAnchorNode.remove();
+        }
+
+        function importJSON() {
+            // 触发隐藏的文件选择框
+            document.getElementById('json-file-input').click();
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const importedData = JSON.parse(e.target.result);
+
+                    // 验证数据格式
+                    if (!importedData.nodes || !importedData.edges) {
+                        alert("JSON 格式不正确！需要包含 nodes 和 edges 字段。");
+                        return;
+                    }
+
+                    // 清除当前所有地图元素
+                    clearAllMapData();
+
+                    // 导入节点数据
+                    data.nodes = importedData.nodes;
+                    data.edges = importedData.edges;
+
+                    // 先渲染所有节点
+                    data.nodes.forEach(node => {
+                        renderNode(node);
+                    });
+
+                    // 再渲染所有连线
+                    data.edges.forEach(edge => {
+                        renderEdge(edge);
+                    });
+
+                    showToast("导入成功！");
+
+                    // 自动缩放到所有点
+                    if (data.nodes.length > 0) {
+                        const bounds = L.latLngBounds(data.nodes.map(n => n.pos));
+                        map.fitBounds(bounds, { padding: [50, 50] });
+                    }
+
+                } catch (error) {
+                    alert("导入失败：" + error.message);
+                }
+            };
+            reader.readAsText(file);
+
+            // 重置文件输入，允许重复导入同一文件
+            event.target.value = '';
+        }
+
+        function clearAllMapData() {
+            // 清除所有 marker
+            Object.values(markersMap).forEach(marker => {
+                map.removeLayer(marker);
+            });
+            Object.keys(markersMap).forEach(key => delete markersMap[key]);
+
+            // 清除所有 polyline
+            Object.values(polylinesMap).forEach(polyline => {
+                map.removeLayer(polyline);
+            });
+            Object.keys(polylinesMap).forEach(key => delete polylinesMap[key]);
+
+            // 清除数据
+            data.nodes = [];
+            data.edges = [];
+
+            // 隐藏属性面板
+            deselectAll();
+        }
+
+        function toggleDragLock() {
+            dragLocked = !dragLocked;
+            const btn = document.getElementById('drag-lock-btn');
+
+            if (dragLocked) {
+                btn.innerText = '🔒 已锁定拖动';
+                btn.classList.remove('btn-primary');
+                btn.classList.add('btn-danger');
+            } else {
+                btn.innerText = '🔓 允许拖动';
+                btn.classList.remove('btn-danger');
+                btn.classList.add('btn-primary');
+            }
+
+            // 更新所有现有 marker 的拖动状态
+            Object.values(markersMap).forEach(marker => {
+                if (dragLocked) {
+                    marker.dragging.disable();
+                } else {
+                    marker.dragging.enable();
+                }
+            });
+
+            showToast(dragLocked ? "已锁定所有点的拖动" : "已解锁所有点的拖动");
+        }
+
+        function showToast(msg) {
+            // 简单的提示，实际可以用更好看的UI
+            const d = document.createElement('div');
+            d.style.cssText = "position:fixed; bottom:20px; right:20px; background:rgba(0,0,0,0.7); color:white; padding:10px 20px; border-radius:5px; z-index:9999;";
+            d.innerText = msg;
+            document.body.appendChild(d);
+            setTimeout(() => d.remove(), 2000);
+        }
+
+        // 启动
+        initMap();
+
+    </script>
+</body>
+</html>
