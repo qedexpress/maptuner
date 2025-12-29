@@ -77,6 +77,7 @@
             <label><strong>操作控制:</strong></label>
             <div style="display: flex; gap: 5px;">
                 <button id="drag-lock-btn" class="btn btn-primary" onclick="toggleDragLock()" style="flex: 1; margin: 0;">🔓 允许拖动</button>
+                <button id="confirm-btn" class="btn btn-danger" onclick="toggleConfirmation()" style="flex: 1; margin: 0;">✓ 请求确认</button>
                 <button id="undo-btn" class="btn btn-primary" onclick="undo()" style="flex: 1; margin: 0;" disabled>↶ 撤销</button>
                 <button id="redo-btn" class="btn btn-primary" onclick="redo()" style="flex: 1; margin: 0;" disabled>↷ 重做</button>
             </div>
@@ -121,6 +122,7 @@
         let selectedNodeUuid = null; // 用于连线时的第一个点
         let editingEntity = null; // 当前正在编辑的对象 {type: 'node'|'edge', uuid: ''}
         let dragLocked = false; // 拖动锁定状态
+        let confirmationEnabled = true; // 是否启用删除确认
         let rectangleSelector = null; // 用于框选的矩形
         let isAutoMarkingMode = false; // 是否处于自动打点模式
 
@@ -383,7 +385,7 @@
 
         function deleteCurrentEntity() {
             if (!editingEntity) return;
-            if (!confirm("确定要删除吗？")) return;
+            if (confirmationEnabled && !confirm("确定要删除吗？")) return;
 
             if (editingEntity.type === 'node') {
                 // 删除点及相关连线
@@ -555,7 +557,7 @@
             const btn = document.getElementById('drag-lock-btn');
 
             if (dragLocked) {
-                btn.innerText = '🔒 已锁定拖动';
+                btn.innerText = '🔒 拒绝拖动';
                 btn.classList.remove('btn-primary');
                 btn.classList.add('btn-danger');
             } else {
@@ -573,7 +575,24 @@
                 }
             });
 
-            showToast(dragLocked ? "已锁定所有点的拖动" : "已解锁所有点的拖动");
+            showToast(dragLocked ? "已拒绝所有点的拖动" : "已允许所有点的拖动");
+        }
+
+        function toggleConfirmation() {
+            confirmationEnabled = !confirmationEnabled;
+            const btn = document.getElementById('confirm-btn');
+
+            if (confirmationEnabled) {
+                btn.innerText = '✓ 请求确认';
+                btn.classList.remove('btn-success');
+                btn.classList.add('btn-danger');
+            } else {
+                btn.innerText = '✗ 跳过确认';
+                btn.classList.remove('btn-danger');
+                btn.classList.add('btn-success');
+            }
+
+            showToast(confirmationEnabled ? "已启用删除确认" : "已禁用删除确认");
         }
 
         function showToast(msg) {
