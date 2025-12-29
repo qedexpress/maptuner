@@ -38,7 +38,9 @@
         .btn-primary { background-color: #007bff; }
         .btn-success { background-color: #28a745; }
         .btn-danger { background-color: #dc3545; }
+        .btn-secondary { background-color: #6c757d; }
         .btn:hover { opacity: 0.9; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         
         .mode-selector { display: flex; gap: 5px; margin-bottom: 10px; }
         .mode-btn { flex: 1; padding: 8px; background: #e9ecef; border: 1px solid #ced4da; cursor: pointer; color: #495057; }
@@ -72,8 +74,13 @@
         </div>
 
         <div class="control-group">
-            <label><strong>拖动控制:</strong></label>
-            <button id="drag-lock-btn" class="btn btn-primary" onclick="toggleDragLock()">🔓 允许拖动</button>
+            <label><strong>操作控制:</strong></label>
+            <div style="display: flex; gap: 5px;">
+                <button id="drag-lock-btn" class="btn btn-primary" onclick="toggleDragLock()" style="flex: 1; margin: 0;">🔓 允许拖动</button>
+                <button id="undo-btn" class="btn btn-primary" onclick="undo()" style="flex: 1; margin: 0;" disabled>↶ 撤销</button>
+                <button id="redo-btn" class="btn btn-primary" onclick="redo()" style="flex: 1; margin: 0;" disabled>↷ 重做</button>
+            </div>
+            <div style="font-size: 11px; color: #999; margin-top: 3px;">快捷键: Ctrl+Z 撤销 | Ctrl+Y 重做</div>
         </div>
 
         <div class="control-group">
@@ -117,6 +124,11 @@
         let rectangleSelector = null; // 用于框选的矩形
         let isAutoMarkingMode = false; // 是否处于自动打点模式
 
+        // 操作历史
+        let history = []; // 历史记录栈
+        let historyIndex = -1; // 当前历史位置
+        let isApplyingHistory = false; // 是否正在应用历史记录（避免循环记录）
+
         // Leaflet 图层存储，用于交互
         const markersMap = {}; // uuid -> leaflet marker
         const polylinesMap = {}; // uuid -> leaflet polyline
@@ -139,6 +151,23 @@
                     deselectAll();
                 }
             });
+
+            // 键盘快捷键监听
+            document.addEventListener('keydown', function(e) {
+                // Ctrl+Z 撤销
+                if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+                    e.preventDefault();
+                    undo();
+                }
+                // Ctrl+Y 或 Ctrl+Shift+Z 重做
+                else if ((e.ctrlKey && e.key === 'y') || (e.ctrlKey && e.shiftKey && e.key === 'z')) {
+                    e.preventDefault();
+                    redo();
+                }
+            });
+
+            // 初始化历史记录
+            saveHistory('init');
         }
 
         // --- 核心逻辑：添加节点 ---
@@ -149,10 +178,13 @@
                 name: "New Point",
                 pos: [latlng.lat, latlng.lng]
             };
-            
+
             data.nodes.push(newNode);
             renderNode(newNode);
             console.log("Added Node:", newNode);
+
+            // 保存历史
+            saveHistory('add_node');
         }
 
         // --- 渲染节点 ---
@@ -176,6 +208,8 @@
                     if (editingEntity && editingEntity.uuid === nodeData.uuid) {
                         loadProperties('node', nodeData.uuid); // 刷新面板坐标显示
                     }
+                    // 拖动结束后保存历史
+                    saveHistory('move_node');
                 }
             });
 
@@ -211,8 +245,8 @@
         // --- 核心逻辑：添加连线 ---
         function addEdge(startUuid, endUuid) {
             // 检查是否重复
-            const exists = data.edges.some(e => 
-                (e.start === startUuid && e.end === endUuid) || 
+            const exists = data.edges.some(e =>
+                (e.start === startUuid && e.end === endUuid) ||
                 (e.start === endUuid && e.end === startUuid)
             );
             if (exists) {
@@ -240,6 +274,9 @@
             data.edges.push(newEdge);
             renderEdge(newEdge);
             console.log("Added Edge:", newEdge);
+
+            // 保存历史
+            saveHistory('add_edge');
         }
 
         // --- 渲染连线 ---
@@ -339,6 +376,9 @@
                 edge.car_punish = parseFloat(document.getElementById('inp-car').value);
             }
             showToast("属性已保存");
+
+            // 保存历史
+            saveHistory('edit_properties');
         }
 
         function deleteCurrentEntity() {
@@ -348,7 +388,7 @@
             if (editingEntity.type === 'node') {
                 // 删除点及相关连线
                 const uuid = editingEntity.uuid;
-                
+
                 // 1. 删除相关连线数据和视图
                 const relatedEdges = data.edges.filter(e => e.start === uuid || e.end === uuid);
                 relatedEdges.forEach(e => {
@@ -374,6 +414,9 @@
 
             deselectAll();
             document.getElementById('properties-panel').style.display = 'none';
+
+            // 保存历史
+            saveHistory('delete');
         }
 
         // --- 辅助功能 ---
@@ -472,6 +515,9 @@
                         const bounds = L.latLngBounds(data.nodes.map(n => n.pos));
                         map.fitBounds(bounds, { padding: [50, 50] });
                     }
+
+                    // 保存历史
+                    saveHistory('import');
 
                 } catch (error) {
                     alert("导入失败：" + error.message);
@@ -622,6 +668,9 @@
                     const addedEdges = await autoConnectNodes(addedNodes, bounds);
                     updateAutoMarkStatus(`完成！添加了 ${addedNodes.length} 个路口和 ${addedEdges.length} 条连线`);
                     showToast(`自动打点完成：${addedNodes.length} 个路口，${addedEdges.length} 条连线`);
+
+                    // 保存历史
+                    saveHistory('auto_marking');
                 }
 
             } catch (error) {
@@ -878,6 +927,105 @@
         function updateAutoMarkStatus(message) {
             const statusDiv = document.getElementById('auto-mark-status');
             statusDiv.innerText = message;
+        }
+
+        // --- 操作历史管理 ---
+
+        function saveHistory(action) {
+            // 如果正在应用历史记录，不保存新的历史
+            if (isApplyingHistory) return;
+
+            // 深拷贝当前数据状态
+            const snapshot = {
+                nodes: JSON.parse(JSON.stringify(data.nodes)),
+                edges: JSON.parse(JSON.stringify(data.edges)),
+                action: action,
+                timestamp: Date.now()
+            };
+
+            // 如果当前不在历史的末尾，删除后面的历史
+            if (historyIndex < history.length - 1) {
+                history = history.slice(0, historyIndex + 1);
+            }
+
+            // 添加新的历史记录
+            history.push(snapshot);
+            historyIndex++;
+
+            // 限制历史记录数量（最多保存50条）
+            if (history.length > 50) {
+                history.shift();
+                historyIndex--;
+            }
+
+            // 更新按钮状态
+            updateHistoryButtons();
+        }
+
+        function undo() {
+            if (historyIndex <= 0) return;
+
+            historyIndex--;
+            applyHistoryState(history[historyIndex]);
+            updateHistoryButtons();
+        }
+
+        function redo() {
+            if (historyIndex >= history.length - 1) return;
+
+            historyIndex++;
+            applyHistoryState(history[historyIndex]);
+            updateHistoryButtons();
+        }
+
+        function applyHistoryState(snapshot) {
+            isApplyingHistory = true;
+
+            // 清除所有地图元素
+            clearAllMapData();
+
+            // 恢复数据
+            data.nodes = JSON.parse(JSON.stringify(snapshot.nodes));
+            data.edges = JSON.parse(JSON.stringify(snapshot.edges));
+
+            // 重新渲染所有节点
+            data.nodes.forEach(node => {
+                renderNode(node);
+            });
+
+            // 重新渲染所有连线
+            data.edges.forEach(edge => {
+                renderEdge(edge);
+            });
+
+            isApplyingHistory = false;
+        }
+
+        function updateHistoryButtons() {
+            const undoBtn = document.getElementById('undo-btn');
+            const redoBtn = document.getElementById('redo-btn');
+
+            // 更新撤销按钮
+            if (historyIndex > 0) {
+                undoBtn.disabled = false;
+                undoBtn.classList.remove('btn-secondary');
+                undoBtn.classList.add('btn-primary');
+            } else {
+                undoBtn.disabled = true;
+                undoBtn.classList.remove('btn-primary');
+                undoBtn.classList.add('btn-secondary');
+            }
+
+            // 更新重做按钮
+            if (historyIndex < history.length - 1) {
+                redoBtn.disabled = false;
+                redoBtn.classList.remove('btn-secondary');
+                redoBtn.classList.add('btn-primary');
+            } else {
+                redoBtn.disabled = true;
+                redoBtn.classList.remove('btn-primary');
+                redoBtn.classList.add('btn-secondary');
+            }
         }
 
         // 启动
