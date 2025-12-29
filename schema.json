@@ -1,0 +1,142 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.com/map-data.schema.json",
+  "title": "Map Data",
+  "description": "OSM 地图标注工具生成的节点和边数据",
+  "type": "object",
+  "required": ["nodes", "edges"],
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "description": "地图上的节点（路口）数组",
+      "items": {
+        "$ref": "#/definitions/node"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "description": "连接节点的边（道路）数组",
+      "items": {
+        "$ref": "#/definitions/edge"
+      }
+    }
+  },
+  "definitions": {
+    "node": {
+      "type": "object",
+      "description": "地图上的一个节点（路口）",
+      "required": ["uuid", "name", "pos"],
+      "properties": {
+        "uuid": {
+          "type": "string",
+          "description": "节点的唯一标识符（UUID v4 格式）",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "examples": ["a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"]
+        },
+        "name": {
+          "type": "string",
+          "description": "节点的名称或描述",
+          "minLength": 1,
+          "examples": ["路口", "红绿灯", "三岔路口", "路口 (4条路)", "人行横道"]
+        },
+        "pos": {
+          "type": "array",
+          "description": "节点的地理坐标 [纬度, 经度]",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": [
+            {
+              "type": "number",
+              "description": "纬度（Latitude）",
+              "minimum": -90,
+              "maximum": 90
+            },
+            {
+              "type": "number",
+              "description": "经度（Longitude）",
+              "minimum": -180,
+              "maximum": 180
+            }
+          ],
+          "examples": [[36.070165121277796, 120.41910235636723]]
+        }
+      },
+      "additionalProperties": false
+    },
+    "edge": {
+      "type": "object",
+      "description": "连接两个节点的边（道路）",
+      "required": ["uuid", "start", "end", "distance", "walk_punish", "bike_punish", "car_punish"],
+      "properties": {
+        "uuid": {
+          "type": "string",
+          "description": "边的唯一标识符（UUID v4 格式）",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "examples": ["b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e"]
+        },
+        "start": {
+          "type": "string",
+          "description": "起始节点的 UUID",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "end": {
+          "type": "string",
+          "description": "终止节点的 UUID",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "distance": {
+          "type": "number",
+          "description": "两个节点之间的距离（单位：米），使用球面几何计算",
+          "minimum": 0,
+          "examples": [150.25, 1234.56]
+        },
+        "walk_punish": {
+          "type": "number",
+          "description": "步行惩罚系数，用于路径规划算法",
+          "default": 0,
+          "examples": [0, 0.5, 1.0]
+        },
+        "bike_punish": {
+          "type": "number",
+          "description": "骑行惩罚系数，用于路径规划算法",
+          "default": 0,
+          "examples": [0, 0.5, 1.0]
+        },
+        "car_punish": {
+          "type": "number",
+          "description": "驾车惩罚系数，用于路径规划算法",
+          "default": 0,
+          "examples": [0, 0.5, 1.0]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "examples": [
+    {
+      "nodes": [
+        {
+          "uuid": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "name": "路口",
+          "pos": [36.070165121277796, 120.41910235636723]
+        },
+        {
+          "uuid": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+          "name": "红绿灯",
+          "pos": [36.071234567890123, 120.42012345678901]
+        }
+      ],
+      "edges": [
+        {
+          "uuid": "c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f",
+          "start": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "end": "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+          "distance": 150.25,
+          "walk_punish": 0,
+          "bike_punish": 0,
+          "car_punish": 0
+        }
+      ]
+    }
+  ]
+}
